@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Streamlit app: Signal Sentinel — clean token name/symbol joins
+# Streamlit app: TrenchFeed — clean token name/symbol joins
 # - Joins `name`,`symbol` from `tokens` by `token_address` for ALL tabs
 # - Drops existing name/symbol before merge to avoid overlap errors
 # - Early Leaders ordered by creation time (ASC), null-safe for pair_created_at
@@ -469,7 +469,7 @@ def score_and_classify(
     return out
 
 # ============================= UI =============================
-st.title("Signal Sentinel")
+st.title("TrenchFeed")
 
 with st.sidebar:
     st.markdown("**Controls**")
