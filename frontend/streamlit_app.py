@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 
 # ============================= Config =============================
-st.set_page_config(page_title="Signal Sentinel — Early Leaders", layout="wide")
+st.set_page_config(page_title="TrenchFeed — Early Leaders", layout="wide")
 
 def cfg(key: str, default: str = "") -> str:
     v = os.environ.get(key, default)
