@@ -562,7 +562,7 @@ tab_leaders, tab_all, tab_detail, tab_top, tab_radar = st.tabs([
 
 # ============================= Early Leaders =============================
 with tab_leaders:
-    st.subheader("Early Leaders (algorithmic)")
+    st.subheader("Early Leaders")
     pairs = fetch_recent_pairs(max_pairs, recency_hours, max_age_minutes, use_snapshot_fallback=use_snapshot_fallback)
     if pairs.empty:
         st.info("No recent pairs in the selected window.")
@@ -641,7 +641,7 @@ with tab_detail:
     st.subheader("Token Detail")
     q_token = st.text_input("Token address", help="Paste token address")
     if q_token:
-        if st.button("Fetch latest via Helius"):
+        if st.button("Fetch latest Data"):
             import subprocess
             helius_path = "/opt/sol/etl/hel.py"
             try:
@@ -739,7 +739,7 @@ with tab_detail:
 # ============================= Top Coins =============================
 with tab_top:
     st.subheader("Top Coins by Price Increase and Momentum")
-    st.caption("Views 24h, 3d, 7d. Links use token or pair automatically.")
+    st.caption("Views 24h, 3d, 7d. Links use token or pair automatically. Some Dexscreener links may be degraded due to dead coins.")
     def render_view(vn: str):
         df = fetch_view(vn, limit=2000)
         if df.empty:
