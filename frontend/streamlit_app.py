@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# Streamlit app: TrenchFeed — clean token name/symbol joins
-# - Joins `name`,`symbol` from `tokens` by `token_address` for ALL tabs
-# - Drops existing name/symbol before merge to avoid overlap errors
-# - Early Leaders ordered by creation time (ASC), null-safe for pair_created_at
-# - Launch Radar aligned with classifier and also null-safe
+# Streamlit app: TrenchFeed — fixed Top Coins links for Birdeye and Solscan
+# Key change: robust token_address derivation in Top Coins so link cols always populate.
+# - If token_address missing, use base_token when available.
+# - If still missing, map from pair_address -> base_token via pairs table.
+# - Link column display text unified to "Open" for consistency.
 
 import os
 from typing import Dict, List, Optional, Iterable, Set
@@ -47,10 +47,17 @@ def now_utc() -> pd.Timestamp:
 def iso(ts: pd.Timestamp) -> str:
     if ts is None or pd.isna(ts):
         return ""
-    return pd.Timestamp(ts).tz_convert("UTC").isoformat()
+    try:
+        utc_ts = pd.Timestamp(ts).tz_convert("UTC")
+    except Exception:
+        utc_ts = pd.Timestamp(ts).tz_localize("UTC")
+    utc_ts = utc_ts.floor("s")
+    return utc_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def iso_hours_ago(hours: int) -> str:
-    return (now_utc() - pd.Timedelta(hours=hours)).isoformat()
+    ts = now_utc() - pd.Timedelta(hours=hours)
+    ts = ts.floor("s")
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def to_dt(x):
     return pd.to_datetime(x, utc=True, errors="coerce")
@@ -93,9 +100,9 @@ def link_config(cols: List[str]):
     if "dexscreener" in cols:
         cfg_map["dexscreener"] = colmod.LinkColumn("Dexscreener", display_text="Open")
     if "solscan" in cols:
-        cfg_map["solscan"] = colmod.LinkColumn("Solscan", display_text="Scan")
+        cfg_map["solscan"] = colmod.LinkColumn("Solscan", display_text="Open")
     if "birdeye" in cols:
-        cfg_map["birdeye"] = colmod.LinkColumn("Birdeye", display_text="Bird")
+        cfg_map["birdeye"] = colmod.LinkColumn("Birdeye", display_text="Open")
     return cfg_map
 
 # -------- REST base
@@ -188,9 +195,7 @@ def ensure_pair_links(df: pd.DataFrame, token_col: str = "token_address") -> pd.
         out.loc[:, "pair_address"] = out[token_col].map(lambda t: pmap.get(str(t), ""))
     return out
 
-# -------- Token name/symbol join (simple & collision-safe)
 def attach_token_names(df: pd.DataFrame, token_col: str = "token_address") -> pd.DataFrame:
-    """Join name/symbol from tokens by token_address; drop any existing name/symbol first."""
     out = df.copy()
     if out.empty or token_col not in out.columns:
         for c in ["name","symbol"]:
@@ -198,16 +203,43 @@ def attach_token_names(df: pd.DataFrame, token_col: str = "token_address") -> pd
                 out[c] = ""
         return out
     toks = out[token_col].dropna().astype(str).unique().tolist()
-    meta = fetch_tokens_for_addresses(toks)  # token_address, name, symbol
+    meta = fetch_tokens_for_addresses(toks)
     if meta.empty:
         for c in ["name","symbol"]:
             if c not in out.columns:
                 out[c] = ""
         return out
-    # drop to avoid overlap
     out = out.drop(columns=[c for c in ["name","symbol"] if c in out.columns])
     out = out.merge(meta.rename(columns={"token_address": token_col}), on=token_col, how="left")
     out[["name","symbol"]] = out[["name","symbol"]].fillna("")
+    return out
+
+def ensure_token_column(df: pd.DataFrame, token_col: str = "token_address") -> pd.DataFrame:
+    """Guarantee a usable token_address for link building.
+    Priority: existing token_col -> base_token -> lookup by pair_address in pairs table.
+    """
+    out = df.copy()
+    if token_col in out.columns and out[token_col].astype(str).str.len().gt(0).any():
+        # Even if some rows are empty, keep and try to fill below
+        pass
+    else:
+        out[token_col] = ""
+
+    # Fill from base_token when present
+    if "base_token" in out.columns:
+        mask = out[token_col].astype(str).eq("")
+        out.loc[mask, token_col] = out.loc[mask, "base_token"].astype(str)
+
+    # Remaining blanks, resolve via pair_address -> base_token
+    if "pair_address" in out.columns:
+        need = out[token_col].astype(str).eq("")
+        p_list = out.loc[need, "pair_address"].dropna().astype(str).unique().tolist()
+        if p_list:
+            where = {"pair_address": "in.(" + ",".join(p_list) + ")"}
+            mp = fetch_table("pairs", select="pair_address,base_token", where=where, limit=len(p_list)*2)
+            if not mp.empty:
+                base_map = {str(r["pair_address"]): str(r["base_token"]) for _, r in mp.iterrows() if r.get("pair_address") and r.get("base_token")}
+                out.loc[need, token_col] = out.loc[need, "pair_address"].map(base_map).fillna(out.loc[need, token_col])
     return out
 
 # ============================= Classifier utilities =============================
@@ -456,14 +488,14 @@ def score_and_classify(
             if not conc_ok: missing.append("Concentration")
             if not unq_ok:  missing.append("Uniques")
             if not br_ok:   missing.append("BuyRatio")
-            reasons.append(" & ".join(missing) if missing else "Borderline")
+            reasons.append(" ".join(missing) if missing else "Borderline")
         else:
             labels.append("Loser")
             why = []
             if not vel_ok: why.append("Low velocity")
             if not unq_ok: why.append("Low uniques")
             if not br_ok:  why.append("Unbalanced flow")
-            reasons.append(" & ".join(why) if why else "Weak")
+            reasons.append(" ".join(why) if why else "Weak")
     out["classification"] = labels
     out["reason"] = reasons
     return out
@@ -473,11 +505,8 @@ st.title("TrenchFeed")
 
 with st.sidebar:
     st.markdown("**Controls**")
-    # Replace the auto refresh slider with a manual refresh button
     if st.button("Manual Refresh"):
-        # Trigger a rerun of the app when clicked
-        st.experimental_rerun()
-    # General configuration sliders
+        st.rerun()
     max_pairs       = st.slider("Max pairs to scan", 200, 10000, 2000, 100)
     recency_hours   = st.slider("Only tokens newer than (hours)", 1, 72, 2, 1)
     max_age_minutes = st.slider("Max token age for candidates (minutes)", 1, 240, 30, 1)
@@ -615,10 +644,7 @@ with tab_all:
 with tab_detail:
     st.subheader("Token Detail")
     q_token = st.text_input("Token address", help="Paste token address")
-    # When a token address is provided, allow the user to manually fetch the latest data from Helius.
     if q_token:
-        # Provide a manual trigger to run the Helius ETL for the given token address. This calls
-        # an external script that updates our Supabase tables with fresh data for the token.
         if st.button("Fetch latest via Helius"):
             import subprocess
             helius_path = "/opt/sol/etl/hel.py"
@@ -627,7 +653,6 @@ with tab_detail:
                 st.success("Refreshed from Helius. You can now view updated tables.")
             except Exception as e:
                 st.warning(f"Helius refresh failed: {e}")
-        # Fetch token-level metadata from Supabase after (or regardless of) refresh
         tok = fetch_table("tokens", select="token_address,chain_id,name,symbol,updated_at", where={"token_address": f"eq.{q_token}"}, limit=1)
         if not tok.empty: tok["updated_at"] = to_dt(tok.get("updated_at"))
         st.write("Tokens")
@@ -718,17 +743,19 @@ with tab_detail:
 # ============================= Top Coins =============================
 with tab_top:
     st.subheader("Top Coins by Price Increase and Momentum")
-    st.caption("Views 24h/3d/7d, with token name/symbol joined via tokens.")
+    st.caption("Views 24h/3d/7d, with robust links for Dexscreener, Solscan, Birdeye.")
     def render_view(vn: str):
         df = fetch_view(vn, limit=2000)
         if df.empty:
             st.info(f"No rows in {vn} or view not found.")
             return
+        # Normalize token_address column from alternate names, then ensure it for all rows
         if "token_address" not in df.columns:
-            for alt in ["base_token","token","token_addr"]:
+            for alt in ["base_token","token","token_addr","tokenaddress","mint","mint_address"]:
                 if alt in df.columns:
                     df = df.rename(columns={alt: "token_address"})
                     break
+        df = ensure_token_column(df, token_col="token_address")
         df = ensure_pair_links(df, token_col="token_address")
         df = attach_token_names(df, token_col="token_address")
         df = add_links(df, dexscreener_mode="pair")
@@ -751,7 +778,6 @@ with tab_top:
 with tab_radar:
     st.subheader("Launch Radar")
     lookback_iso = iso(now_utc() - pd.Timedelta(minutes=radar_window_m))
-    # Fetch recent pairs with additional market_cap_usd to allow filtering by market cap
     recent_pairs = fetch_table(
         "pairs",
         select="pair_address,token_address:base_token,base_token_name,base_token_symbol,pair_created_at,snapshot_ts,price_usd,fdv_usd,market_cap_usd",
@@ -796,7 +822,6 @@ with tab_radar:
         ranked = ensure_pair_links(ranked, token_col="token_address")
         ranked = attach_token_names(ranked, token_col="token_address")
         ranked = add_links(ranked, dexscreener_mode="pair")
-        # Filter out tokens with market caps below 30k USD. Convert market_cap_usd to numeric first.
         if "market_cap_usd" in ranked.columns:
             ranked = numeric(ranked, ["market_cap_usd"])
             ranked = ranked[ranked["market_cap_usd"].fillna(0) >= 30000]
