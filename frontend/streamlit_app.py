@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # Streamlit app: TrenchFeed — clean token name/symbol joins
 # - Joins `name`,`symbol` from `tokens` by `token_address` for ALL tabs
@@ -42,70 +41,16 @@ SESSION.headers.update({
 })
 
 # ============================= Helpers =============================
-
-def format_suffix(val: float) -> str:
-    try:
-        val = float(val)
-        if val >= 1_000_000_000_000:
-            return f"{val / 1_000_000_000_000:.2f}T"
-        elif val >= 1_000_000_000:
-            return f"{val / 1_000_000_000:.2f}B"
-        elif val >= 1_000_000:
-            return f"{val / 1_000_000:.2f}M"
-        elif val >= 1_000:
-            return f"{val / 1_000:.2f}k"
-        else:
-            return f"{val:.2f}"
-    except:
-        return "-"
-
-def suffix_column_config(cols: List[str]):
-    cfg_map = link_config(cols)
-    colmod = getattr(st, "column_config", None)
-    if colmod and hasattr(colmod, "Column"):
-        for col in cols:
-            if col == "market_cap_usd":
-                cfg_map[col] = colmod.Column("Market Cap", format_func=format_suffix)
-    return cfg_map
 def now_utc() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
 def iso(ts: pd.Timestamp) -> str:
-    """
-    Convert a pandas Timestamp to a UTC ISO8601 string ending with 'Z'.
-
-    Supabase’s HTTP API expects timestamps in the canonical `YYYY-MM-DDTHH:MM:SSZ`
-    format without a timezone offset (i.e. the trailing `Z` denotes UTC).
-    Pandas’ `.isoformat()` includes a `+00:00` offset when a timezone is attached,
-    which Supabase does not always parse as expected. This helper normalises the
-    timestamp by converting it to UTC, flooring to seconds (to drop microseconds),
-    and formatting it explicitly with `strftime`.
-    """
     if ts is None or pd.isna(ts):
         return ""
-    try:
-        utc_ts = pd.Timestamp(ts).tz_convert("UTC")
-    except Exception:
-        # If ts has no timezone information, localise to UTC first
-        utc_ts = pd.Timestamp(ts).tz_localize("UTC")
-    # Floor to seconds to avoid microseconds, which Supabase may reject
-    utc_ts = utc_ts.floor("s")
-    return utc_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return pd.Timestamp(ts).tz_convert("UTC").isoformat()
 
 def iso_hours_ago(hours: int) -> str:
-    """
-    Return an ISO8601 timestamp (UTC) string `hours` in the past.
-
-    Supabase expects timestamps to end with `Z` rather than a timezone offset.
-    Using `.isoformat()` on a timezone-aware pandas `Timestamp` produces
-    strings like `2025-09-12T10:15:30+00:00`, which Supabase may not accept
-    when used with the `gte.` filter. This helper instead floors the time to
-    seconds and formats it explicitly to `YYYY-MM-DDTHH:MM:SSZ`.
-    """
-    ts = now_utc() - pd.Timedelta(hours=hours)
-    # Floor to seconds
-    ts = ts.floor("s")
-    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (now_utc() - pd.Timedelta(hours=hours)).isoformat()
 
 def to_dt(x):
     return pd.to_datetime(x, utc=True, errors="coerce")
@@ -531,7 +476,7 @@ with st.sidebar:
     # Replace the auto refresh slider with a manual refresh button
     if st.button("Manual Refresh"):
         # Trigger a rerun of the app when clicked
-        st.rerun()
+        st.experimental_rerun()
     # General configuration sliders
     max_pairs       = st.slider("Max pairs to scan", 200, 10000, 2000, 100)
     recency_hours   = st.slider("Only tokens newer than (hours)", 1, 72, 2, 1)
@@ -603,18 +548,18 @@ with tab_leaders:
         if leaders.empty:
             st.info("No tokens currently meet the Early Leader thresholds.")
         else:
-            st.dataframe(leaders[shown].reset_index(drop=True), use_container_width=True, height=520, column_config=suffix_column_config(shown))
+            st.dataframe(leaders[shown].reset_index(drop=True), use_container_width=True, height=520, column_config=link_config(shown))
 
         with st.expander("Show Hype / Risky (for manual review)", expanded=False):
             hype = ranked[ranked["classification"].eq("Hype / Risky")] \
                         .sort_values(["effective_created_at","early_score"], ascending=[True, False])
             shown_h = [c for c in cols if c in hype.columns]
-            st.dataframe(hype[shown_h].reset_index(drop=True), use_container_width=True, height=320, column_config=suffix_column_config(shown_h))
+            st.dataframe(hype[shown_h].reset_index(drop=True), use_container_width=True, height=320, column_config=link_config(shown_h))
 
         with st.expander("All Scored Candidates (debug / review)", expanded=False):
             shown_r = [c for c in cols if c in ranked.columns]
             st.dataframe(ranked[shown_r + [c for c in ["classification","reason"] if c not in shown_r]].reset_index(drop=True),
-                         use_container_width=True, height=360, column_config=suffix_column_config(shown_r))
+                         use_container_width=True, height=360, column_config=link_config(shown_r))
 
 # ============================= All Candidates =============================
 with tab_all:
@@ -664,7 +609,7 @@ with tab_all:
             "pair_address","quote_token_symbol","quote_token_name",
         ]
         shown = [c for c in cols if c in pairs.columns]
-        st.dataframe(pairs[shown].reset_index(drop=True), use_container_width=True, height=620, column_config=suffix_column_config(shown))
+        st.dataframe(pairs[shown].reset_index(drop=True), use_container_width=True, height=620, column_config=link_config(shown))
 
 # ============================= Token Detail =============================
 with tab_detail:
@@ -729,7 +674,7 @@ with tab_detail:
             pairs_q = add_links(pairs_q, dexscreener_mode="pair")
         st.write("Pairs")
         st.dataframe(pairs_q.reset_index(drop=True), use_container_width=True, height=250,
-                     column_config=suffix_column_config(list(pairs_q.columns) if not pairs_q.empty else []))
+                     column_config=link_config(list(pairs_q.columns) if not pairs_q.empty else []))
 
         pair_ids: List[str] = list(pairs_q["pair_address"].dropna().unique()) if not pairs_q.empty else []
         pair_ids_str = ",".join(pair_ids[:500])
@@ -796,7 +741,7 @@ with tab_top:
             "age_hours","pair_address","last_seen","snapshot_ts"
         ]
         shown = [c for c in cols if c in df.columns]
-        st.dataframe(df[shown].reset_index(drop=True), use_container_width=True, height=620, column_config=suffix_column_config(shown))
+        st.dataframe(df[shown].reset_index(drop=True), use_container_width=True, height=620, column_config=link_config(shown))
     t24, t3d, t7d = st.tabs(["24h", "3d", "7d"])
     with t24: render_view("top_coins_24h")
     with t3d: render_view("top_coins_3d")
@@ -868,6 +813,6 @@ with tab_radar:
         shown = [c for c in cols if c in ranked.columns]
         ranked = ranked.sort_values(["effective_created_at","classification","early_score"],
                                     ascending=[True, True, False]).head(radar_max).reset_index(drop=True)
-        st.dataframe(ranked[shown], use_container_width=True, height=640, column_config=suffix_column_config(shown))
+        st.dataframe(ranked[shown], use_container_width=True, height=640, column_config=link_config(shown))
 
 # ============================= End of application =============================
