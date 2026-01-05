@@ -1,3 +1,5 @@
+
+
 #!/usr/bin/env python3
 # Streamlit app: TrenchFeed - robust Top Coins link generation (Dexscreener, Solscan, Birdeye)
 # Key fixes:
@@ -14,8 +16,79 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# Optional auto-refresh component.  Attempt import from the third‑party package; if unavailable, leave as None.
+try:
+    from streamlit_autorefresh import st_autorefresh  # type: ignore
+except Exception:
+    st_autorefresh = None  # fallback: no automatic refresh
+
 # ============================= Config =============================
-st.set_page_config(page_title="TrenchFeed - Early Leaders", layout="wide")
+st.set_page_config(page_title="TrenchFeed - Early Leaders", page_icon="🚀", layout="wide")
+# Inject custom CSS for a modern, beautiful dashboard.  This styling enhances the
+# overall look and feel without altering the underlying functionality.  The
+# gradient background, dark sidebar, styled headings, and improved table colors
+# provide a cohesive visual experience.
+custom_css = """
+/* Remove default Streamlit main menu and footer */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+
+/* General body styling with gradient background and subtle text coloring */
+[data-testid="stAppViewContainer"] {
+    background-color: #0F2027;
+    background-image: linear-gradient(120deg, #0F2027 0%, #203A43 50%, #2C5364 100%);
+    color: #E0E0E0;
+}
+
+/* Style the sidebar with a darker shade and consistent text color */
+[data-testid="stSidebar"] {
+    background-color: #1A2B3A;
+    color: #E0E0E0;
+}
+
+/* Enhance appearance of sliders and toggles in sidebar */
+[data-testid="stSidebar"] .stSlider > div, [data-testid="stSidebar"] .stToggle > label {
+    color: #E0E0E0;
+}
+[data-testid="stSidebar"] .stSlider > div[data-baseweb="slider"] {
+    background-color: rgba(255,255,255,0.05);
+    border-radius: 4px;
+    padding: 4px;
+}
+
+/* Headings styling with gradient text effect */
+h1 {
+    font-size: 2.5rem;
+    font-weight: 700;
+    background: linear-gradient(90deg, #00C9FF, #92FE9D);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+h2, h3, h4 {
+    color: #E0E0E0;
+}
+
+/* Style hyperlinks to stand out on dark background */
+a {
+    color: #71C7EC;
+}
+
+/* Style for Streamlit dataframes (Ag-Grid) */
+.ag-theme-streamlit {
+    background-color: rgba(255,255,255,0.02) !important;
+    color: #E0E0E0 !important;
+    font-size: 14px;
+}
+.ag-theme-streamlit .ag-header, .ag-theme-streamlit .ag-header-cell {
+    background-color: rgba(255,255,255,0.06) !important;
+    color: #E0E0E0 !important;
+    font-weight: bold;
+}
+.ag-theme-streamlit .ag-row-hover {
+    background-color: rgba(255,255,255,0.05) !important;
+}
+"""
+st.markdown(f"<style>{custom_css}</style>", unsafe_allow_html=True)
 
 def cfg(key: str, default: str = "") -> str:
     v = os.environ.get(key, default)
@@ -77,11 +150,22 @@ def rest_get(table: str, params: Dict[str, str], start: int = 0, stop: int = 999
     headers["Range-Unit"] = "items"
     headers["Range"] = f"{start}-{stop}"
     r = SESSION.get(url, params=params, headers=headers, timeout=timeout)
+    # Successful responses include 200 and 206 (partial).  Return parsed JSON.
     if r.status_code in (200, 206):
         try:
             return r.json()
         except Exception:
             return []
+    # Handle database timeouts gracefully: Supabase returns HTTP 500 with a cancellation code.
+    if r.status_code == 500:
+        # Display a user-friendly message rather than a raw exception.  Note: st may not be available in
+        # all contexts, but this ensures that the UI remains clean for top_coins views.
+        try:
+            st.info(f"The '{table}' view timed out. Please reduce the date range or lower the row limit and try again.")
+        except Exception:
+            pass
+        return []
+    # For other errors, log a warning with truncated details
     st.warning(f"Fetch error for {table}: HTTP {r.status_code}: {r.text[:240]}")
     return []
 
@@ -408,8 +492,29 @@ def compute_early_metrics(
             sw = sw[sw["ts"].fillna(pd.Timestamp.max.tz_localize("UTC")) >= created]
 
         first_ts = _first_trade_ts(sw)
-        out.at[i, "first_trade_ts"] = first_ts
-        out.at[i, "time_to_first_trade_s"] = float(max(0.0, (first_ts - created).total_seconds())) if pd.notna(first_ts) else np.inf
+        # Compute time to first trade using the original timezone-aware timestamp.  Do not
+        # cast to naive before subtracting, as that would raise an exception when mixed with
+        # timezone-aware 'created'.
+        if pd.notna(first_ts):
+            try:
+                out.at[i, "time_to_first_trade_s"] = float(max(0.0, (first_ts - created).total_seconds()))
+            except Exception:
+                out.at[i, "time_to_first_trade_s"] = np.inf
+        else:
+            out.at[i, "time_to_first_trade_s"] = np.inf
+        # Cast the stored first trade timestamp to a timezone‑naive datetime to avoid future
+        # dtype incompatibility warnings.  We preserve the instant by removing the timezone
+        # after conversion.
+        if pd.notna(first_ts):
+            try:
+                cast_ts = pd.to_datetime(first_ts)
+                if cast_ts.tzinfo is not None:
+                    cast_ts = cast_ts.tz_convert(None)
+            except Exception:
+                cast_ts = pd.NaT
+        else:
+            cast_ts = pd.NaT
+        out.at[i, "first_trade_ts"] = cast_ts
 
         if pd.notna(first_ts):
             burst_end = first_ts + pd.Timedelta(seconds=burst_window_s)
@@ -500,64 +605,107 @@ def score_and_classify(
     score_01 = score_01 * (1.0 - 0.9 * lp_pen)
     out["early_score"] = (score_01.clip(0, 1) * 100.0).round(1)
 
+    # Classification order is critical: strong tokens should not fall through to "Loser" simply because
+    # the tradeability or LP removal gates are checked first.  We first check for Early Leader and Hype
+    # classifications before assigning any Loser labels.  Only after evaluating those categories do we
+    # fallback to Loser statuses based on trade activity and LP events.
     labels, reasons = [], []
+    # Precompute float early scores once
+    early_scores = out["early_score"].astype(float).fillna(0.0)
     for trd, vel_ok, unq_ok, br_ok, conc_ok, lp_ok, sc in zip(
-        gate_tradeable, gate_velocity, gate_uniques, gate_br, gate_conc, gate_lp_ok, out["early_score"].astype(float).fillna(0.0)
+        gate_tradeable, gate_velocity, gate_uniques, gate_br, gate_conc, gate_lp_ok, early_scores
     ):
-        if not trd:
-            labels.append("Loser (no early trades)"); reasons.append("No trade <=10m"); continue
-        if not lp_ok:
-            labels.append("Loser (early LP remove)"); reasons.append("LP removed <=15m"); continue
+        # Prioritize Early Leader classification
         if (vel_ok and unq_ok and br_ok and conc_ok and sc >= leader_score_min):
-            labels.append("Early Leader"); reasons.append("Velocity+Uniques+Balance+Dispersion")
-        elif (vel_ok and (unq_ok or br_ok)) or sc >= 35.0:
+            labels.append("Early Leader")
+            reasons.append("Velocity+Uniques+Balance+Dispersion")
+            continue
+        # Next consider borderline / hype tokens.  We treat any token with score >=35 or with high velocity
+        # alongside either sufficient uniques or a balanced buy ratio as "Hype / Risky".  Reasons encode
+        # missing gates to help explain borderline cases.
+        if sc >= 35.0 or (vel_ok and (unq_ok or br_ok)):
             labels.append("Hype / Risky")
             missing = []
-            if not conc_ok: missing.append("Concentration")
-            if not unq_ok:  missing.append("Uniques")
-            if not br_ok:   missing.append("BuyRatio")
+            if not conc_ok:
+                missing.append("Concentration")
+            if not unq_ok:
+                missing.append("Uniques")
+            if not br_ok:
+                missing.append("BuyRatio")
             reasons.append(" & ".join(missing) if missing else "Borderline")
-        else:
-            labels.append("Loser")
-            why = []
-            if not vel_ok: why.append("Low velocity")
-            if not unq_ok: why.append("Low uniques")
-            if not br_ok:  why.append("Unbalanced flow")
-            reasons.append("Weak" if not why else " & ".join(why))
+            continue
+        # Only now consider outright losers based on trading and LP removal
+        if not trd:
+            labels.append("Loser (no early trades)")
+            reasons.append("No trade <=10m")
+            continue
+        if not lp_ok:
+            labels.append("Loser (early LP remove)")
+            reasons.append("LP removed <=15m")
+            continue
+        # Default loser classification when thresholds are not met
+        labels.append("Loser")
+        why = []
+        if not vel_ok:
+            why.append("Low velocity")
+        if not unq_ok:
+            why.append("Low uniques")
+        if not br_ok:
+            why.append("Unbalanced flow")
+        reasons.append("Weak" if not why else " & ".join(why))
     out["classification"] = labels
     out["reason"] = reasons
     return out
 
 # ============================= UI =============================
 st.title("TrenchFeed")
+st.caption("Robust Top Coins link generation (Dexscreener, Solscan, Birdeye)")
 
 with st.sidebar:
-    st.markdown("**Controls**")
-    if st.button("Manual Refresh"):
-        st.rerun()
-    max_pairs       = st.slider("Max pairs to scan", 200, 10000, 2000, 100)
-    recency_hours   = st.slider("Only tokens newer than (hours)", 1, 72, 2, 1)
-    max_age_minutes = st.slider("Max token age for candidates (minutes)", 1, 240, 30, 1)
-    use_snapshot_fallback = st.toggle("Use snapshot_ts when pair_created_at is NULL", value=True)
-    st.markdown("---")
-    st.markdown("**Early Leader thresholds**")
-    min_swaps_per_min = st.slider("Min swaps/min in 2m burst", 1, 80, 20, 1)
-    min_uniques_10m   = st.slider("Min unique traders in first 10m", 5, 200, 50, 5)
-    buy_center        = st.slider("Buy ratio center", 0.40, 0.70, 0.55, 0.01)
-    buy_tol           = st.slider("Buy ratio tolerance (±)", 0.05, 0.35, 0.25, 0.01)
-    max_conc          = st.slider("Max Top-5 concentration", 0.50, 0.95, 0.70, 0.01)
-    leader_score_min  = st.slider("Min Early Leader score", 0, 100, 60, 1)
-    st.markdown("---")
-    radar_window_m  = st.slider("Launch Radar: lookback minutes", 30, 240, 120, 15)
-    radar_max       = st.slider("Launch Radar: max rows", 20, 400, 120, 20)
-    detail_limit    = st.slider("Token Detail: rows per table", 50, 5000, 500, 50)
+    # Encapsulate all controls in an expander for a cleaner, more organized look
+    with st.expander("🛠️ Controls & Settings", expanded=True):
+        # Manual refresh button with icon
+        if st.button("🔄 Manual Refresh"):
+            st.rerun()
+
+        # Settings for scanning tokens and windows
+        max_pairs       = st.slider("Max pairs to scan", 200, 10000, 2000, 100)
+        recency_hours   = st.slider("Only tokens newer than (hours)", 1, 72, 2, 1)
+        max_age_minutes = st.slider("Max token age for candidates (minutes)", 1, 240, 30, 1)
+        use_snapshot_fallback = st.toggle("Use snapshot_ts when pair_created_at is NULL", value=True)
+
+        st.markdown("---")
+        st.markdown("**Early Leader thresholds**")
+        min_swaps_per_min = st.slider("Min swaps/min in 2m burst", 1, 80, 20, 1)
+        min_uniques_10m   = st.slider("Min unique traders in first 10m", 5, 200, 50, 5)
+        buy_center        = st.slider("Buy ratio center", 0.40, 0.70, 0.55, 0.01)
+        buy_tol           = st.slider("Buy ratio tolerance (±)", 0.05, 0.35, 0.25, 0.01)
+        max_conc          = st.slider("Max Top-5 concentration", 0.50, 0.95, 0.70, 0.01)
+        leader_score_min  = st.slider("Min Early Leader score", 0, 100, 60, 1)
+
+        st.markdown("---")
+        radar_window_m  = st.slider("Launch Radar: lookback minutes", 30, 240, 120, 15)
+        radar_max       = st.slider("Launch Radar: max rows", 20, 400, 120, 20)
+        detail_limit    = st.slider("Token Detail: rows per table", 50, 5000, 500, 50)
+
+        st.markdown("---")
+        st.markdown("**Auto Refresh**")
+        auto_refresh_enabled = st.toggle("Enable Auto Refresh", value=False)
+        # Allow the user to specify a refresh interval in seconds when auto refresh is enabled.
+        refresh_interval = None
+        if auto_refresh_enabled:
+            refresh_interval = st.slider("Refresh interval (seconds)", 15, 600, 60, 15)
+        # Schedule an automatic rerun of the script if auto refresh is on and the autorefresh
+        # component is available.  Convert seconds to milliseconds as required by st_autorefresh.
+        if auto_refresh_enabled and refresh_interval and callable(st_autorefresh):
+            st_autorefresh(interval=int(refresh_interval * 1000), key="auto_refresh")
 
 tab_leaders, tab_all, tab_detail, tab_top, tab_radar = st.tabs([
-    "Early Leaders",
-    "All Candidates",
-    "Token Detail",
-    "Top Coins",
-    "Launch Radar"
+    "🏆 Early Leaders",
+    "📋 All Candidates",
+    "🔎 Token Detail",
+    "📈 Top Coins",
+    "🚀 Launch Radar"
 ])
 
 # ============================= Early Leaders =============================
@@ -592,12 +740,26 @@ with tab_leaders:
         cols = [
             "early_score","classification","reason",
             "swaps_per_min_burst","uniq_traders_10m","buy_ratio_15m","top5_concentration",
-            "lp_add_usd_15","lp_remove_usd_15",
+            # LP columns are removed from the display in Early Leaders; metrics still include them
             "token_address","name","symbol",
             "dexscreener","solscan","birdeye",
             "pair_address","effective_created_at","first_trade_ts","time_to_first_trade_s",
         ]
         shown = [c for c in cols if c in ranked.columns]
+        # Display summary metrics for Early Leaders.  These indicators give a quick glance at
+        # how many tokens fall into each classification and how strong they are on average.
+        if not ranked.empty:
+            leader_count = int((ranked.get("classification") == "Early Leader").sum()) if "classification" in ranked.columns else 0
+            hype_count   = int((ranked.get("classification") == "Hype / Risky").sum()) if "classification" in ranked.columns else 0
+            loser_count  = int(ranked.get("classification").astype(str).str.contains("Loser").sum()) if "classification" in ranked.columns else 0
+            avg_score    = float(ranked.get("early_score").mean()) if "early_score" in ranked.columns else float('nan')
+            max_score    = float(ranked.get("early_score").max()) if "early_score" in ranked.columns else float('nan')
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Leaders", f"{leader_count}")
+            c2.metric("Hype", f"{hype_count}")
+            c3.metric("Losers", f"{loser_count}")
+            c4.metric("Avg Score", f"{avg_score:.1f}" if not pd.isna(avg_score) else "N/A")
+            c5.metric("Top Score", f"{max_score:.1f}" if not pd.isna(max_score) else "N/A")
         st.dataframe(ranked[shown].reset_index(drop=True), use_container_width=True, height=520, column_config=link_config(shown))
 
 # ============================= All Candidates =============================
@@ -741,7 +903,9 @@ with tab_top:
     st.subheader("Top Coins by Price Increase and Momentum")
     st.caption("Views 24h, 3d, 7d. Links use token or pair automatically. Some Dexscreener links may be degraded due to dead coins.")
     def render_view(vn: str):
-        df = fetch_view(vn, limit=2000)
+        # Use a smaller limit for the 24h view to avoid long-running queries and HTTP 500 errors.
+        limit_rows = 1000 if vn == "top_coins_24h" else 2000
+        df = fetch_view(vn, limit=limit_rows)
         if df.empty:
             st.info(f"No rows in {vn} or view not found.")
             return
@@ -846,10 +1010,23 @@ with tab_radar:
             "dexscreener","solscan","birdeye",
             "early_score","classification","reason",
             "swaps_per_min_burst","uniq_traders_10m","buy_ratio_15m","top5_concentration",
-            "lp_add_usd_15","lp_remove_usd_15",
+            # LP columns are intentionally excluded from Launch Radar display
             "pair_address",
         ]
         shown = [c for c in cols if c in ranked.columns]
-        ranked = ranked.sort_values(["effective_created_at","classification","early_score"],
-                                    ascending=[True, True, False]).head(radar_max).reset_index(drop=True)
+        # Sort Launch Radar strictly by highest early_score first.  This ensures that top-scoring
+        # tokens (actual winners) appear first instead of being grouped by classification or
+        # alphabetical order.  We drop secondary sorting by classification/effective_created_at.
+        ranked = ranked.sort_values(["early_score"], ascending=[False]).head(radar_max).reset_index(drop=True)
+        # Display summary metrics for Launch Radar.  These metrics provide a quick overview
+        # of the newly launched pairs and how many qualify as leaders or hype tokens.
+        total_pairs    = len(ranked)
+        lr_leaders     = int((ranked.get("classification") == "Early Leader").sum()) if "classification" in ranked.columns else 0
+        lr_hype        = int((ranked.get("classification") == "Hype / Risky").sum()) if "classification" in ranked.columns else 0
+        lr_avg_score   = float(ranked.get("early_score").mean()) if "early_score" in ranked.columns else float('nan')
+        col_a, col_b, col_c, col_d = st.columns(4)
+        col_a.metric("New Pairs", f"{total_pairs}")
+        col_b.metric("Leaders", f"{lr_leaders}")
+        col_c.metric("Hype", f"{lr_hype}")
+        col_d.metric("Avg Score", f"{lr_avg_score:.1f}" if not pd.isna(lr_avg_score) else "N/A")
         st.dataframe(ranked[shown], use_container_width=True, height=640, column_config=link_config(shown))
