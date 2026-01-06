@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 # Streamlit app: TrenchFeed - robust Top Coins link generation (Dexscreener, Solscan, Birdeye)
 # Key fixes:
@@ -126,6 +124,43 @@ a {
 .subscribe-btn:hover {
     transform: translateY(-2px);
     box-shadow: 0 4px 20px rgba(0, 201, 255, 0.3);
+}
+
+/* Stream status indicator styling */
+.stream-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+}
+.stream-status.live {
+    background: linear-gradient(135deg, rgba(0, 201, 255, 0.15) 0%, rgba(146, 254, 157, 0.15) 100%);
+    border: 1px solid rgba(0, 201, 255, 0.4);
+    color: #92FE9D;
+}
+.stream-status.paused {
+    background: rgba(255, 185, 0, 0.12);
+    border: 1px solid rgba(255, 185, 0, 0.4);
+    color: #FFB900;
+}
+.stream-status .pulse {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #92FE9D;
+    animation: pulse-glow 1.5s ease-in-out infinite;
+}
+.stream-status.paused .pulse {
+    background: #FFB900;
+    animation: none;
+}
+@keyframes pulse-glow {
+    0%, 100% { opacity: 1; box-shadow: 0 0 4px rgba(146, 254, 157, 0.6); }
+    50% { opacity: 0.5; box-shadow: 0 0 12px rgba(146, 254, 157, 0.9); }
 }
 """
 st.markdown(f"<style>{custom_css}</style>", unsafe_allow_html=True)
@@ -1201,7 +1236,7 @@ with tab_detail:
         st.write("Wallets")
         st.dataframe(w.reset_index(drop=True), use_container_width=True, height=200)
 
-# ============================= Top Coins =============================
+# ============================= Top Coins (LIVE) =============================
 with tab_top:
     # Transform the Top Coins tab into a live streaming dashboard.  The live feed
     # connects to the enterprise streaming endpoint and renders incoming events
@@ -1220,14 +1255,58 @@ with tab_top:
         "trenchfeed.cc</a> and grab a subscription.</div>",
         unsafe_allow_html=True,
     )
-    # Button to refresh the streaming feed
-    refresh_feed = st.button("🔄 Refresh Feed", key="refresh_feed")
-    # Initialize session state storage for streaming events
-    if "stream_data" not in st.session_state or refresh_feed:
+    
+    # Initialize stream control state
+    if "stream_paused" not in st.session_state:
+        st.session_state.stream_paused = False
+    if "stream_data" not in st.session_state:
+        st.session_state.stream_data = []
+    if "stream_initialized" not in st.session_state:
+        st.session_state.stream_initialized = False
+    
+    # Create button row with Refresh and Pause/Resume side by side
+    btn_col1, btn_col2, status_col = st.columns([1, 1, 2])
+    
+    with btn_col1:
+        refresh_feed = st.button("🔄 Refresh Feed", key="refresh_feed", use_container_width=True)
+    
+    with btn_col2:
+        # Toggle pause/resume state
+        is_paused = st.session_state.stream_paused
+        pause_label = "▶️ Resume" if is_paused else "⏸️ Pause"
+        if st.button(pause_label, key="pause_resume", use_container_width=True):
+            st.session_state.stream_paused = not st.session_state.stream_paused
+            st.rerun()
+    
+    with status_col:
+        # Display current stream status with visual indicator
+        if st.session_state.stream_paused:
+            st.markdown(
+                '<div class="stream-status paused">'
+                '<span class="pulse"></span>'
+                'PAUSED'
+                '</div>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                '<div class="stream-status live">'
+                '<span class="pulse"></span>'
+                'STREAMING'
+                '</div>',
+                unsafe_allow_html=True
+            )
+    
+    # Handle refresh - reset data and re-initialize
+    if refresh_feed:
         st.session_state.stream_data = []
         st.session_state.stream_initialized = False
+        st.session_state.stream_paused = False
+        st.rerun()
+    
     # Placeholder for the live table
     live_placeholder = st.empty()
+    
     # Define a mapping from raw column names to degen‑friendly jargon.  These
     # names resonate with crypto traders while remaining self‑explanatory.
     _live_rename_map = {
@@ -1244,45 +1323,73 @@ with tab_top:
         "payload.current_swap.trader_wallet": "Trader Wallet",
         "payload.timestamp": "Event Timestamp",
     }
+    
+    def render_stream_table():
+        """Render the current stream data as a table."""
+        if not st.session_state.stream_data:
+            live_placeholder.info("No data yet. Waiting for stream events...")
+            return
+        
+        try:
+            df_stream = pd.json_normalize(st.session_state.stream_data)
+        except Exception:
+            df_stream = pd.DataFrame(st.session_state.stream_data)
+        
+        # Drop the recent_swaps column if present, as it contains opaque objects
+        if "payload.recent_swaps" in df_stream.columns:
+            df_stream = df_stream.drop(columns=["payload.recent_swaps"])
+        
+        # Rename columns using the friendly mapping where available
+        rename_map = {k: v for k, v in _live_rename_map.items() if k in df_stream.columns}
+        df_stream = df_stream.rename(columns=rename_map)
+        
+        # Determine primary columns (after rename, if rename occurred)
+        primary_raw = ["payload.token.name", "payload.token.symbol", "payload.pair.base_token"]
+        primary_cols = [rename_map.get(col, _live_rename_map.get(col, col)) for col in primary_raw if (rename_map.get(col, _live_rename_map.get(col, col)) in df_stream.columns)]
+        
+        # Build an ordered list of columns: primary first, then the rest
+        other_cols = [c for c in df_stream.columns if c not in primary_cols]
+        ordered_cols = primary_cols + other_cols
+        
+        # Take the last 50 events and reverse order so newest events appear first
+        df_show = df_stream[ordered_cols].tail(50).iloc[::-1].copy()
+        
+        # Assign descending row numbers (highest at top) as the index
+        n_rows = len(df_show)
+        df_show.index = range(n_rows, 0, -1)
+        
+        # Display the table
+        live_placeholder.dataframe(
+            df_show,
+            use_container_width=True,
+            height=620,
+        )
+    
     def run_live_stream():
         """Internal helper to consume streaming data and update the table."""
         # Collect a bounded number of events to avoid infinite loops
         for event in stream_enterprise(max_events=200):
+            # Check if stream is paused - if so, stop consuming new events
+            # Note: Due to Streamlit's execution model, this check happens
+            # between events. The pause takes effect after the current event.
+            if st.session_state.stream_paused:
+                break
+            
             # Append the raw event to our session state
             st.session_state.stream_data.append(event)
-            # Build a DataFrame from the accumulated events.  json_normalize flattens
-            # nested objects and automatically creates columns for each key.
-            try:
-                df_stream = pd.json_normalize(st.session_state.stream_data)
-            except Exception:
-                # Fall back to a simple DataFrame if normalization fails
-                df_stream = pd.DataFrame(st.session_state.stream_data)
-            # Drop the recent_swaps column if present, as it contains opaque objects
-            if "payload.recent_swaps" in df_stream.columns:
-                df_stream = df_stream.drop(columns=["payload.recent_swaps"])
-            # Rename columns using the friendly mapping where available
-            rename_map = {k: v for k, v in _live_rename_map.items() if k in df_stream.columns}
-            df_stream = df_stream.rename(columns=rename_map)
-            # Determine primary columns (after rename, if rename occurred)
-            primary_raw = ["payload.token.name", "payload.token.symbol", "payload.pair.base_token"]
-            primary_cols = [rename_map.get(col, _live_rename_map.get(col, col)) for col in primary_raw if (rename_map.get(col, _live_rename_map.get(col, col)) in df_stream.columns)]
-            # Build an ordered list of columns: primary first, then the rest
-            other_cols = [c for c in df_stream.columns if c not in primary_cols]
-            ordered_cols = primary_cols + other_cols
-            # Take the last 50 events and reverse order so newest events appear first
-            df_show = df_stream[ordered_cols].tail(50).iloc[::-1].copy()
-            # Assign descending row numbers (highest at top) as the index
-            n_rows = len(df_show)
-            df_show.index = range(n_rows, 0, -1)
-            # Display the table
-            live_placeholder.dataframe(
-                df_show,
-                use_container_width=True,
-                height=620,
-            )
+            
+            # Render the updated table
+            render_stream_table()
+    
+    # If paused, just render the existing data
+    if st.session_state.stream_paused:
+        render_stream_table()
     # Start the stream when the component first renders or upon refresh
-    if not st.session_state.get("stream_initialized"):
+    elif not st.session_state.get("stream_initialized"):
         st.session_state.stream_initialized = True
+        run_live_stream()
+    else:
+        # Already initialized and not paused - continue streaming
         run_live_stream()
 
 # ============================= Launch Radar =============================
