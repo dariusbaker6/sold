@@ -8,6 +8,7 @@
 # 3) dexscreener prefers pair_address if present, else falls back to token_address
 # 4) LinkColumn config applied only if available
 # 5) sanity caption shows row counts and valid token/pair counts
+# 6) PAYWALL: Requires valid API key from api_customers table
 
 import os
 from typing import Dict, List, Optional, Iterable, Set, Tuple
@@ -89,6 +90,43 @@ a {
 .ag-theme-streamlit .ag-row-hover {
     background-color: rgba(255,255,255,0.05) !important;
 }
+
+/* Paywall styling */
+.paywall-container {
+    max-width: 500px;
+    margin: 100px auto;
+    padding: 40px;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    text-align: center;
+}
+.paywall-title {
+    font-size: 2rem;
+    margin-bottom: 1rem;
+    background: linear-gradient(90deg, #00C9FF, #92FE9D);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+.paywall-subtitle {
+    color: #A0A0A0;
+    margin-bottom: 2rem;
+}
+.subscribe-btn {
+    display: inline-block;
+    padding: 12px 32px;
+    background: linear-gradient(90deg, #00C9FF, #92FE9D);
+    color: #0F2027 !important;
+    text-decoration: none;
+    border-radius: 8px;
+    font-weight: bold;
+    margin-top: 1rem;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+.subscribe-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 20px rgba(0, 201, 255, 0.3);
+}
 """
 st.markdown(f"<style>{custom_css}</style>", unsafe_allow_html=True)
 
@@ -116,6 +154,142 @@ SESSION.headers.update({
     "Accept-Profile": SB_SCHEMA,
     "Content-Profile": SB_SCHEMA,
 })
+
+# ============================= PAYWALL AUTHENTICATION =============================
+STRIPE_PURCHASE_URL = "https://buy.stripe.com/dRm7sLdUF0DR2m7ga07IY08"
+
+def validate_api_key(api_key: str) -> Tuple[bool, str, Optional[Dict]]:
+    """
+    Validate an API key against the api_customers table.
+    
+    Returns:
+        Tuple of (is_valid, message, customer_data)
+    """
+    if not api_key or not api_key.strip():
+        return False, "Please enter your API key.", None
+    
+    api_key = api_key.strip()
+    
+    try:
+        url = f"{SB_URL}/rest/v1/api_customers"
+        params = {
+            "select": "id,email,api_key,tier,status,expires_at",
+            "api_key": f"eq.{api_key}",
+            "limit": "1"
+        }
+        
+        response = SESSION.get(url, params=params, timeout=10)
+        
+        if response.status_code not in (200, 206):
+            return False, f"Error validating API key. Please try again.", None
+        
+        data = response.json()
+        
+        if not data or len(data) == 0:
+            return False, "Invalid API key. Please check your key or subscribe to get access.", None
+        
+        customer = data[0]
+        
+        # Check status
+        if customer.get("status") != "active":
+            status = customer.get("status", "unknown")
+            return False, f"Your subscription is {status}. Please renew to continue.", None
+        
+        # Check expiration for trial tier
+        if customer.get("tier") == "trial" and customer.get("expires_at"):
+            expires_at = pd.to_datetime(customer["expires_at"], utc=True)
+            now = pd.Timestamp.now(tz="UTC")
+            if expires_at < now:
+                return False, "Your trial has expired. Please subscribe to continue.", None
+        
+        return True, f"Welcome! Tier: {customer.get('tier', 'unknown').upper()}", customer
+        
+    except requests.exceptions.Timeout:
+        return False, "Connection timeout. Please try again.", None
+    except requests.exceptions.RequestException as e:
+        return False, f"Network error. Please check your connection.", None
+    except Exception as e:
+        return False, f"Validation error. Please try again.", None
+
+def show_paywall():
+    """Display the paywall page with API key input and purchase link."""
+    st.markdown("""
+        <div class="paywall-container">
+            <div class="paywall-title">🔒 TrenchFeed Dashboard</div>
+            <div class="paywall-subtitle">Enter your API key to access the live dashboard</div>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    # Center the input form
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("### 🔑 Enter API Key")
+        
+        # API Key input
+        api_key_input = st.text_input(
+            "API Key",
+            type="password",
+            placeholder="tk_live_xxxxxxxxxxxxx",
+            help="Enter your TrenchFeed API key"
+        )
+        
+        # Login button
+        if st.button("🚀 Access Dashboard", type="primary", use_container_width=True):
+            if api_key_input:
+                is_valid, message, customer = validate_api_key(api_key_input)
+                if is_valid:
+                    st.session_state["authenticated"] = True
+                    st.session_state["api_key"] = api_key_input
+                    st.session_state["customer"] = customer
+                    st.success(message)
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error(message)
+            else:
+                st.warning("Please enter your API key.")
+        
+        st.markdown("---")
+        
+        # Subscribe section
+        st.markdown("### 💳 Don't have an API key?")
+        st.markdown("""
+            Get instant access to:
+            - 📊 Real-time market data streaming
+            - 🚀 Launch Radar for new tokens
+            - 🏆 Early Leader identification
+            - 🔎 Deep token analytics
+        """)
+        
+        st.markdown(f"""
+            <a href="{STRIPE_PURCHASE_URL}" target="_blank" class="subscribe-btn">
+                Subscribe Now →
+            </a>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.caption("After subscribing, you'll receive your API key via email.")
+
+def check_authentication() -> bool:
+    """Check if user is authenticated. Returns True if authenticated."""
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+    
+    return st.session_state.get("authenticated", False)
+
+def logout():
+    """Clear authentication state."""
+    st.session_state["authenticated"] = False
+    st.session_state["api_key"] = None
+    st.session_state["customer"] = None
+
+# ============================= CHECK AUTHENTICATION =============================
+if not check_authentication():
+    show_paywall()
+    st.stop()
+
+# ============================= AUTHENTICATED USER CONTENT BELOW =============================
 
 # ============================= Helpers =============================
 def now_utc() -> pd.Timestamp:
@@ -758,6 +932,26 @@ def score_and_classify(
 # ============================= UI =============================
 st.title("TrenchFeed")
 st.caption("Robust Top Coins link generation (Dexscreener, Solscan, Birdeye)")
+
+# Show authenticated user info and logout button in sidebar header
+with st.sidebar:
+    customer = st.session_state.get("customer", {})
+    if customer:
+        tier = customer.get("tier", "unknown").upper()
+        email = customer.get("email", "")
+        st.markdown(f"""
+            <div style='background: rgba(0, 201, 255, 0.1); padding: 10px; border-radius: 8px; margin-bottom: 1rem;'>
+                <strong>🔓 Logged In</strong><br>
+                <small>Tier: {tier}</small><br>
+                <small style='color: #888;'>{email[:20]}...</small> 
+            </div>
+        """, unsafe_allow_html=True)
+    
+    if st.button("🚪 Logout", use_container_width=True):
+        logout()
+        st.rerun()
+    
+    st.markdown("---")
 
 with st.sidebar:
     # Encapsulate all controls in an expander for a cleaner, more organized look
