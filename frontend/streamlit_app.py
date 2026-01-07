@@ -1245,7 +1245,7 @@ with tab_top:
     st.subheader("Live Market Data Stream")
     # Display the disclaimer prominently
     display_disclaimer()
-    st.caption("Real‑time streaming of market events from TrenchFeed Enterprise API. \n"
+    st.caption("Real‑time streaming of market events. \n"
                "Click the button below to re‑establish the feed at any time.")
     # Call‑to‑action inviting users to subscribe for uninterrupted access
     st.markdown(
